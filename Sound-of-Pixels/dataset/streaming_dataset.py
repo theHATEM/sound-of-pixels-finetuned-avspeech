@@ -15,14 +15,21 @@ def _stft(self, audio):
 
 
 def compute_stft(audio_tensor, args):
+    audio_np = audio_tensor.cpu().numpy()
+
     stft = librosa.stft(
-        audio_tensor,
+        audio_np,
         n_fft=args.stft_frame,
         hop_length=args.stft_hop,
     )
     amp = np.abs(stft)
     phase = np.angle(stft)
-    return torch.from_numpy(amp), torch.from_numpy(phase)
+
+    # Preemptively force float32 (.float()) to prevent DoubleTensor errors!
+    mag_tensor = torch.from_numpy(amp).unsqueeze(0).float()
+    phase_tensor = torch.from_numpy(phase).unsqueeze(0).float()
+
+    return mag_tensor, phase_tensor
 
     # stft = torch.stft(
     #     audio_tensor,
@@ -69,7 +76,13 @@ class StreamingMUSICMixDataset(IterableDataset):
         self.audio_duration = self.args.audLen / self.args.audRate
 
         # We need to resize the extracted frames to 224x224 for ResNet
-        self.resize = T.Resize((self.args.imgSize, self.args.imgSize))
+        # self.resize = T.Resize((self.args.imgSize, self.args.imgSize))
+        self.img_transform = T.Compose(
+            [
+                T.Resize((self.args.imgSize, self.args.imgSize)),
+                T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            ]
+        )
 
     def __iter__(self):
         mix_pool = []
@@ -125,7 +138,12 @@ class StreamingMUSICMixDataset(IterableDataset):
 
                 # Extract and resize frames ->[num_frames, 3, 224, 224]
                 frames = video_decoder.get_frames_at(indices=indices).data
-                frames = self.resize(frames)
+
+                # 🚨 NEW: Convert to float32 and scale to[0.0, 1.0]
+                frames = frames.float() / 255.0
+
+                # Apply Resize and Normalization
+                frames = self.img_transform(frames)
 
                 # -----------------------------------
                 # C. Extract & Resample Audio Segment
@@ -205,21 +223,19 @@ class StreamingMUSICMixDataset(IterableDataset):
                     mix_pool = []  # Reset for next pair
 
             except Exception as e:
-                # Silently skip broken files
+                # ALWAYS print the error in a streaming dataset so you know if it's breaking!
+                print(f"Skipping video due to error: {e}")
                 continue
 
     def create_train_val_loader(args):
         train_stream = load_dataset(
-            "ProgramComputer/avspeech-visual-audio",
-            streaming=True,
-            split="train[:95%]",
+            "ProgramComputer/avspeech-visual-audio", streaming=True, split="train"
         )
         train_stream = train_stream.shuffle(
             seed=args.seed, buffer_size=100
         ).with_format("torch")
 
         dataset_train = StreamingMUSICMixDataset(train_stream, args, split="train")
-        
 
         loader_train = DataLoader(
             dataset_train,
@@ -232,7 +248,7 @@ class StreamingMUSICMixDataset(IterableDataset):
         val_stream = load_dataset(
             "ProgramComputer/avspeech-visual-audio",
             streaming=True,
-            split="train[95%:]",
+            split="test",
         )
         val_stream = val_stream.with_format("torch")
 
