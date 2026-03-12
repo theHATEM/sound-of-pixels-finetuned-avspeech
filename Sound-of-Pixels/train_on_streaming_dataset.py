@@ -555,7 +555,7 @@ def main(args):
     }
 
     # Eval mode
-    evaluate(netWrapper, loader_val, history, 0, args)
+    # evaluate(netWrapper, loader_val, history, 0, args)
     if args.mode == "eval":
         print("Evaluation Done!")
         return
