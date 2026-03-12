@@ -4,20 +4,59 @@ import torchvision.transforms as T
 import random
 from torch.utils.data import DataLoader, IterableDataset
 from datasets import load_dataset
+import librosa, numpy as np
+
+
+def _stft(self, audio):
+    spec = librosa.stft(audio, n_fft=self.stft_frame, hop_length=self.stft_hop)
+    amp = np.abs(spec)
+    phase = np.angle(spec)
+    return torch.from_numpy(amp), torch.from_numpy(phase)
 
 
 def compute_stft(audio_tensor, args):
-    """Computes STFT using the exact parameters from the paper."""
-    stft = torch.stft(
+    stft = librosa.stft(
         audio_tensor,
-        n_fft=args.stft_frame,  # 1022
-        hop_length=args.stft_hop,  # 256
-        return_complex=True,
-        pad_mode="constant",
+        n_fft=args.stft_frame,
+        hop_length=args.stft_hop,
     )
-    mag = torch.abs(stft).unsqueeze(0)  # Shape:[1, Freq, Time]
-    phase = torch.angle(stft).unsqueeze(0)
-    return mag, phase
+    amp = np.abs(stft)
+    phase = np.angle(stft)
+    return torch.from_numpy(amp), torch.from_numpy(phase)
+
+    # stft = torch.stft(
+    #     audio_tensor,
+    #     n_fft=args.stft_frame,
+    #     hop_length=args.stft_hop,
+    #     return_complex=True,
+    #     pad_mode="constant",
+    # )
+    # mag = torch.abs(stft).unsqueeze(0)
+    # phase = torch.angle(stft).unsqueeze(0)
+    # return mag, phase
+
+
+def music_mix_collate_fn(batch):
+    batched_data = {
+        "mag_mix": torch.stack([item["mag_mix"] for item in batch]),
+        "frames": [
+            torch.stack([item["frames"][n] for item in batch])
+            for n in range(len(batch[0]["frames"]))
+        ],
+        "mags": [
+            torch.stack([item["mags"][n] for item in batch])
+            for n in range(len(batch[0]["mags"]))
+        ],
+    }
+    if "audios" in batch[0]:
+        batched_data["audios"] = [
+            torch.stack([item["audios"][n] for item in batch])
+            for n in range(len(batch[0]["audios"]))
+        ]
+        batched_data["phase_mix"] = torch.stack([item["phase_mix"] for item in batch])
+        batched_data["infos"] = [item["infos"] for item in batch]
+
+    return batched_data
 
 
 class StreamingMUSICMixDataset(IterableDataset):
@@ -169,28 +208,45 @@ class StreamingMUSICMixDataset(IterableDataset):
                 # Silently skip broken files
                 continue
 
+    def create_train_val_loader(args):
+        train_stream = load_dataset(
+            "ProgramComputer/avspeech-visual-audio",
+            streaming=True,
+            split="train[:95%]",
+        )
+        train_stream = train_stream.shuffle(
+            seed=args.seed, buffer_size=100
+        ).with_format("torch")
 
-def music_mix_collate_fn(batch):
-    batched_data = {
-        "mag_mix": torch.stack([item["mag_mix"] for item in batch]),
-        "frames": [
-            torch.stack([item["frames"][n] for item in batch])
-            for n in range(len(batch[0]["frames"]))
-        ],
-        "mags": [
-            torch.stack([item["mags"][n] for item in batch])
-            for n in range(len(batch[0]["mags"]))
-        ],
-    }
-    if "audios" in batch[0]:
-        batched_data["audios"] = [
-            torch.stack([item["audios"][n] for item in batch])
-            for n in range(len(batch[0]["audios"]))
-        ]
-        batched_data["phase_mix"] = torch.stack([item["phase_mix"] for item in batch])
-        batched_data["infos"] = [item["infos"] for item in batch]
+        dataset_train = StreamingMUSICMixDataset(train_stream, args, split="train")
+        
 
-    return batched_data
+        loader_train = DataLoader(
+            dataset_train,
+            batch_size=args.batch_size_per_gpu,
+            num_workers=args.workers,
+            prefetch_factor=2,
+            collate_fn=music_mix_collate_fn,
+        )
+
+        val_stream = load_dataset(
+            "ProgramComputer/avspeech-visual-audio",
+            streaming=True,
+            split="train[95%:]",
+        )
+        val_stream = val_stream.with_format("torch")
+
+        dataset_val = StreamingMUSICMixDataset(val_stream, args, split="val")
+
+        loader_val = DataLoader(
+            dataset_val,
+            batch_size=args.batch_size_per_gpu,
+            num_workers=args.workers,
+            prefetch_factor=2,
+            collate_fn=music_mix_collate_fn,
+        )
+
+        return loader_train, loader_val
 
 
 if __name__ == "__main__":
@@ -213,7 +269,7 @@ if __name__ == "__main__":
     loader_train = DataLoader(
         dataset_train,
         batch_size=args.batch_size_per_gpu,
-        num_workers=2,
+        num_workers=int(args.workers),
         prefetch_factor=2,
         collate_fn=music_mix_collate_fn,
     )
@@ -230,7 +286,7 @@ if __name__ == "__main__":
     loader_val = DataLoader(
         dataset_val,
         batch_size=args.batch_size_per_gpu,
-        num_workers=2,
+        num_workers=int(args.workers),
         prefetch_factor=2,
         collate_fn=music_mix_collate_fn,
     )
