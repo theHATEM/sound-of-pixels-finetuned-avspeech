@@ -27,6 +27,119 @@ from utils import (
 )
 from viz import plot_loss_metrics, HTMLVisualizer
 
+import random
+import torch
+from torch.utils.data import DataLoader, Dataset
+from datasets import load_dataset
+
+
+# ==========================================
+# 1. COMPUTE STFT FOR THE MIXED AUDIO
+# ==========================================
+def compute_stft_mixed(audio_tensor, stft_frame=1022, stft_hop=256):
+    """Computes the STFT of the newly mixed audio on the GPU/CPU"""
+    stft = torch.stft(
+        audio_tensor.float(),
+        n_fft=stft_frame,
+        hop_length=stft_hop,
+        return_complex=True,
+        pad_mode="constant",
+    )
+    mag_mix = torch.abs(stft).unsqueeze(0)
+    phase_mix = torch.angle(stft).unsqueeze(0)
+    return mag_mix, phase_mix
+
+
+# ==========================================
+# 2. THE MAP-STYLE DATASET CLASS
+# ==========================================
+class PreprocessedMixDataset(Dataset):
+    def __init__(
+        self, hf_dataset, num_mix=2, split="train", stft_frame=1022, stft_hop=256
+    ):
+        self.dataset = hf_dataset
+        self.num_mix = num_mix
+        self.split = split
+        self.stft_frame = stft_frame
+        self.stft_hop = stft_hop
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, index):
+        # 1. Select the indices for mixing
+        indices = [index]
+
+        if self.split == "train":
+            # Randomly pick other videos to mix
+            for _ in range(self.num_mix - 1):
+                indices.append(random.randint(0, len(self.dataset) - 1))
+        else:
+            # Deterministic mixing for validation (so val loss is consistent)
+            local_rand = random.Random(index)
+            for _ in range(self.num_mix - 1):
+                indices.append(local_rand.randint(0, len(self.dataset) - 1))
+
+        # 2. Fetch the preprocessed tensors
+        frames = []
+        audios = []
+        mags = []
+        infos = []
+
+        for idx in indices:
+            row = self.dataset[idx]
+            frames.append(row["frame"])  # Shape: (1, 3, 224, 224)
+            audios.append(row["audio"])  # Shape: (65535,)
+            mags.append(row["mag"])  # Shape: (1, 512, 257)
+            infos.append(row["clip_id"])
+
+        # 3. Create the Artificial Audio Mixture
+        mixed_audio = sum(audios)
+
+        # Compute the STFT of the newly mixed audio
+        mag_mix, phase_mix = compute_stft_mixed(
+            mixed_audio, self.stft_frame, self.stft_hop
+        )
+
+        # 4. Return everything in the exact format the Sound of Pixels Model expects
+        return {
+            "mag_mix": mag_mix,
+            "frames": frames,
+            "mags": mags,
+            "audios": audios,
+            "phase_mix": phase_mix,
+            "infos": infos,
+        }
+
+
+# ==========================================
+# 3. THE COLLATOR
+# ==========================================
+def preprocessed_collate_fn(batch):
+    """Stacks the dictionaries into PyTorch Batches"""
+    return {
+        "mag_mix": torch.stack([item["mag_mix"] for item in batch]),
+        "frames": [
+            torch.stack([item["frames"][n] for item in batch])
+            for n in range(len(batch[0]["frames"]))
+        ],
+        "mags": [
+            torch.stack([item["mags"][n] for item in batch])
+            for n in range(len(batch[0]["mags"]))
+        ],
+        "audios": [
+            torch.stack([item["audios"][n] for item in batch])
+            for n in range(len(batch[0]["audios"]))
+        ],
+        "phase_mix": torch.stack([item["phase_mix"] for item in batch]),
+        "infos": [item["infos"] for item in batch],
+    }
+
+
+# ==========================================
+# 4. INITIALIZE DATALOADERS
+# ==========================================
+
 
 # Network wrapper, defines forward pass
 class NetWrapper(torch.nn.Module):
@@ -534,7 +647,52 @@ def main(args):
     nets = (net_sound, net_frame, net_synthesizer)
     crit = builder.build_criterion(arch=args.loss)
 
-    loader_train, loader_val = StreamingMUSICMixDataset.create_train_val_loader(args)
+    print("Downloading and Caching Dataset...")
+
+    # 🌟 LOAD FIRST 90% FOR TRAINING 🌟
+    hf_train = load_dataset(
+        "theHATEM/AVSpeech-Preprocessed-SoundOfPixels",
+        split="train[:90%]",  # Automatically allocates 90% to train
+    )
+    # Convert HF arrays directly into PyTorch tensors
+    hf_train = hf_train.with_format("torch")
+
+    # 🌟 LOAD LAST 10% FOR VALIDATION 🌟
+    hf_val = load_dataset(
+        "theHATEM/AVSpeech-Preprocessed-SoundOfPixels",
+        split="train[90%:]",  # Automatically allocates the remaining 10% to val
+    )
+    hf_val = hf_val.with_format("torch")
+
+    # Wrap in our PyTorch Dataset
+    dataset_train = PreprocessedMixDataset(hf_train, num_mix=2, split="train")
+    dataset_val = PreprocessedMixDataset(hf_val, num_mix=2, split="val")
+
+    # Create the DataLoaders
+    # Because there is no streaming, we can safely max out the CPU workers!
+    loader_train = DataLoader(
+        dataset_train,
+        batch_size=args.batch_size,
+        shuffle=True,  # Native PyTorch shuffling works now!
+        num_workers=args.workers,  # Safe to increase to 8 or 12 in Lightning AI
+        prefetch_factor=4,
+        collate_fn=preprocessed_collate_fn,
+        drop_last=True,  # Prevents batch-size crash at the very end of an epoch
+    )
+
+    loader_val = DataLoader(
+        dataset_val,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.workers,
+        prefetch_factor=4,
+        collate_fn=preprocessed_collate_fn,
+    )
+
+    print(f"✅ Training Loader ready: {len(dataset_train)} samples")
+    print(f"✅ Validation Loader ready: {len(dataset_val)} samples")
+
+    # loader_train, loader_val = StreamingMUSICMixDataset.create_train_val_loader(args)
 
     # args.epoch_iters = len(dataset_train) // args.batch_size
     args.epoch_iters = 1000

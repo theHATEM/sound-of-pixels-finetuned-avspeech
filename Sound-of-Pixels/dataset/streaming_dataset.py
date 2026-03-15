@@ -15,32 +15,32 @@ def _stft(self, audio):
 
 
 def compute_stft(audio_tensor, args):
-    audio_np = audio_tensor.cpu().numpy()
+    # audio_np = audio_tensor.cpu().numpy()
 
-    stft = librosa.stft(
-        audio_np,
-        n_fft=args.stft_frame,
-        hop_length=args.stft_hop,
-    )
-    amp = np.abs(stft)
-    phase = np.angle(stft)
-
-    # Preemptively force float32 (.float()) to prevent DoubleTensor errors!
-    mag_tensor = torch.from_numpy(amp).unsqueeze(0).float()
-    phase_tensor = torch.from_numpy(phase).unsqueeze(0).float()
-
-    return mag_tensor, phase_tensor
-
-    # stft = torch.stft(
-    #     audio_tensor,
+    # stft = librosa.stft(
+    #     audio_np,
     #     n_fft=args.stft_frame,
     #     hop_length=args.stft_hop,
-    #     return_complex=True,
-    #     pad_mode="constant",
     # )
-    # mag = torch.abs(stft).unsqueeze(0)
-    # phase = torch.angle(stft).unsqueeze(0)
-    # return mag, phase
+    # amp = np.abs(stft)
+    # phase = np.angle(stft)
+
+    # # Preemptively force float32 (.float()) to prevent DoubleTensor errors!
+    # mag_tensor = torch.from_numpy(amp).unsqueeze(0).float()
+    # phase_tensor = torch.from_numpy(phase).unsqueeze(0).float()
+
+    # return mag_tensor, phase_tensor
+
+    stft = torch.stft(
+        audio_tensor,
+        n_fft=args.stft_frame,
+        hop_length=args.stft_hop,
+        return_complex=True,
+        pad_mode="constant",
+    )
+    mag = torch.abs(stft).unsqueeze(0)
+    phase = torch.angle(stft).unsqueeze(0)
+    return mag, phase
 
 
 def music_mix_collate_fn(batch):
